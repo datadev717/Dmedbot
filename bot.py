@@ -15,8 +15,8 @@ from datetime import datetime, timedelta
 # ══════════════════════════════════════════
 #  SOZLAMALAR  —  faqat shu yerni o'zgartiring
 # ══════════════════════════════════════════
-BOT_TOKEN = "YANGI_TOKENINGIZNI_SHU_YERGA_KIRITING"
-ADMIN_ID  = 123456789          # Sizning Telegram ID (t.me/userinfobot dan oling)
+BOT_TOKEN = "8437380266:AAH6QqhFGu-VNsHSxjkEpEuw-g9rlqzBVto"
+ADMIN_ID  = 5435636847          # Sizning Telegram ID (t.me/userinfobot dan oling)
 API_URL   = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
 # TEST_MODE = True  → 80 kun = 1 soat (3600 s), qayta eslatma = 5 daqiqa (300 s)
