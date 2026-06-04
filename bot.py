@@ -1,603 +1,653 @@
-#!/usr/bin/env python3
-"""
-Tibbiy Bot v2 — Bemor kuzatuv tizimi
-======================================
-• Shifokor bemor ma'lumotlarini bosqichma-bosqich kiritadi
-• 80 kun (test: 1 soat) o'tgach inline tugmali eslatma yuboriladi
-• "Bog'landim" → yakunlandi | "Bog'lana olmadim" → 5 kun (test: 5 daqiqa) keyin qayta eslatma
-• Multi-shifokor: har birining bemorlar alohida
-• Admin: barcha shifokor va bemorlarni ko'radi, ruxsat beradi
-"""
-
-import sqlite3, json, time, threading, logging, requests
+import os
+import sqlite3
+import threading
+import time
+import logging
 from datetime import datetime, timedelta
+from flask import Flask, request, jsonify
+import requests
 
-# ══════════════════════════════════════════
-#  SOZLAMALAR  —  faqat shu yerni o'zgartiring
-# ══════════════════════════════════════════
-BOT_TOKEN = "8437380266:AAH6QqhFGu-VNsHSxjkEpEuw-g9rlqzBVto"
-ADMIN_ID  = 5435636847          # Sizning Telegram ID (t.me/userinfobot dan oling)
-API_URL   = f"https://api.telegram.org/bot{BOT_TOKEN}"
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+logger = logging.getLogger(__name__)
 
-# TEST_MODE = True  → 80 kun = 1 soat (3600 s), qayta eslatma = 5 daqiqa (300 s)
-# TEST_MODE = False → haqiqiy vaqt
-TEST_MODE             = True
-FIRST_NOTIFY_SECONDS  = 3_600       if TEST_MODE else 80 * 24 * 3600   # 1 soat / 80 kun
-RETRY_NOTIFY_SECONDS  = 300         if TEST_MODE else  5 * 24 * 3600   #  5 daqiqa / 5 kun
+TOKEN = os.environ.get("BOT_TOKEN")
+if not TOKEN:
+    raise RuntimeError("BOT_TOKEN env topilmadi. Render (Environment) bo‘limida BOT_TOKEN ni qo‘ying.")
+ADMIN_ID = int(os.environ.get("ADMIN_ID", "0"))  # Set your Telegram user ID here
+BASE_URL = f"https://api.telegram.org/bot{TOKEN}"
 
-DB_PATH = "medical_bot.db"
+# Test mode: 1 hour = 3600 seconds instead of 80 days
+TEST_MODE = os.environ.get("TEST_MODE", "false").lower() == "true"
+NOTIFY_SECONDS = 3600 if TEST_MODE else 80 * 24 * 3600  # 1 hour test OR 80 days
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[logging.FileHandler("bot.log", encoding="utf-8"), logging.StreamHandler()]
-)
-log = logging.getLogger(__name__)
+app = Flask(__name__)
 
-# ══════════════════════════════════════════
-#  DATABASE
-# ══════════════════════════════════════════
+# ─────────────────────────── DATABASE ───────────────────────────
+
+DB_PATH = os.environ.get("DB_PATH", "medical_bot.db")
+
+def get_db():
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    return conn
+
 def init_db():
-    with sqlite3.connect(DB_PATH) as conn:
-        conn.executescript("""
-            CREATE TABLE IF NOT EXISTS doctors (
-                user_id   INTEGER PRIMARY KEY,
-                username  TEXT DEFAULT '',
-                full_name TEXT DEFAULT '',
-                approved  INTEGER DEFAULT 0,
-                joined_at TEXT
-            );
+    conn = get_db()
+    c = conn.cursor()
+    c.executescript("""
+        CREATE TABLE IF NOT EXISTS doctors (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            telegram_id INTEGER UNIQUE NOT NULL,
+            name TEXT NOT NULL,
+            username TEXT,
+            approved INTEGER DEFAULT 0,
+            created_at TEXT DEFAULT (datetime('now','localtime'))
+        );
 
-            CREATE TABLE IF NOT EXISTS patients (
-                id          INTEGER PRIMARY KEY AUTOINCREMENT,
-                doctor_id   INTEGER NOT NULL,
-                last_name   TEXT DEFAULT '',
-                first_name  TEXT DEFAULT '',
-                birth_year  INTEGER,
-                diagnosis   TEXT DEFAULT '',
-                address     TEXT DEFAULT '',
-                phone       TEXT DEFAULT '',
-                added_at    TEXT,
-                notify_at   TEXT,
-                status      TEXT DEFAULT 'pending',
-                -- pending → eslatma yuborilmagan
-                -- notified → eslatma yuborildi, javob kutilmoqda
-                -- contacted → bog'landi (yakunlandi)
-                -- retry → bog'lana olmadi, qayta eslatma rejalashtirildi
-                retry_at    TEXT,
-                retry_count INTEGER DEFAULT 0,
-                FOREIGN KEY(doctor_id) REFERENCES doctors(user_id)
-            );
+        CREATE TABLE IF NOT EXISTS patients (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            doctor_id INTEGER NOT NULL,
+            full_name TEXT NOT NULL,
+            birth_year INTEGER,
+            phone TEXT,
+            disease TEXT,
+            address TEXT,
+            notes TEXT,
+            created_at TEXT DEFAULT (datetime('now','localtime')),
+            notified INTEGER DEFAULT 0,
+            notify_at TEXT,
+            FOREIGN KEY (doctor_id) REFERENCES doctors(id)
+        );
+    """)
+    conn.commit()
+    conn.close()
+    logger.info("DB initialized.")
 
-            CREATE TABLE IF NOT EXISTS sessions (
-                user_id INTEGER PRIMARY KEY,
-                state   TEXT,
-                data    TEXT
-            );
-        """)
-    log.info("DB tayyor.")
+# ─────────────────────────── TELEGRAM API ───────────────────────────
 
-def conn():
-    return sqlite3.connect(DB_PATH, check_same_thread=False)
-
-# ══════════════════════════════════════════
-#  TELEGRAM YORDAMCHILARI
-# ══════════════════════════════════════════
-def api(method, **kwargs):
+def send_message(chat_id, text, reply_markup=None, parse_mode="HTML"):
+    payload = {
+        "chat_id": chat_id,
+        "text": text,
+        "parse_mode": parse_mode,
+    }
+    if reply_markup:
+        payload["reply_markup"] = reply_markup
     try:
-        r = requests.post(f"{API_URL}/{method}", json=kwargs, timeout=10)
+        r = requests.post(f"{BASE_URL}/sendMessage", json=payload, timeout=10)
         return r.json()
     except Exception as e:
-        log.error(f"API {method}: {e}")
+        logger.error(f"sendMessage error: {e}")
         return {}
 
-def send(chat_id, text, reply_markup=None, parse_mode="HTML"):
-    payload = {"chat_id": chat_id, "text": text, "parse_mode": parse_mode}
-    if reply_markup:
-        payload["reply_markup"] = json.dumps(reply_markup)
-    return api("sendMessage", **payload)
-
-def edit_reply_markup(chat_id, message_id, reply_markup=None):
-    payload = {"chat_id": chat_id, "message_id": message_id}
-    if reply_markup:
-        payload["reply_markup"] = json.dumps(reply_markup)
-    else:
-        payload["reply_markup"] = json.dumps({"inline_keyboard": []})
-    return api("editMessageReplyMarkup", **payload)
-
-def answer_cb(cb_id, text="✅"):
-    api("answerCallbackQuery", callback_query_id=cb_id, text=text)
-
-def get_updates(offset=0):
+def answer_callback(callback_query_id, text=""):
     try:
-        r = requests.get(f"{API_URL}/getUpdates",
-                         params={"offset": offset, "timeout": 30}, timeout=35)
-        return r.json().get("result", [])
+        requests.post(f"{BASE_URL}/answerCallbackQuery", json={
+            "callback_query_id": callback_query_id,
+            "text": text
+        }, timeout=10)
     except Exception as e:
-        log.error(f"getUpdates: {e}")
-        time.sleep(5)
-        return []
+        logger.error(f"answerCallbackQuery error: {e}")
 
-# ══════════════════════════════════════════
-#  SESSION
-# ══════════════════════════════════════════
-def get_sess(uid):
-    with conn() as c:
-        row = c.execute("SELECT state, data FROM sessions WHERE user_id=?", (uid,)).fetchone()
-    return (row[0], json.loads(row[1])) if row else (None, {})
+def edit_message(chat_id, message_id, text, reply_markup=None):
+    payload = {
+        "chat_id": chat_id,
+        "message_id": message_id,
+        "text": text,
+        "parse_mode": "HTML",
+    }
+    if reply_markup:
+        payload["reply_markup"] = reply_markup
+    try:
+        requests.post(f"{BASE_URL}/editMessageText", json=payload, timeout=10)
+    except Exception as e:
+        logger.error(f"editMessageText error: {e}")
 
-def set_sess(uid, state, data=None):
-    with conn() as c:
-        c.execute("INSERT OR REPLACE INTO sessions VALUES(?,?,?)",
-                  (uid, state, json.dumps(data or {})))
-        c.commit()
+def set_webhook(url):
+    r = requests.post(f"{BASE_URL}/setWebhook", json={"url": url, "drop_pending_updates": True})
+    logger.info(f"setWebhook response: {r.json()}")
 
-def del_sess(uid):
-    with conn() as c:
-        c.execute("DELETE FROM sessions WHERE user_id=?", (uid,))
-        c.commit()
+# ─────────────────────────── SESSION (in-memory) ───────────────────────────
+# user_state[chat_id] = {"step": ..., "data": {...}}
+user_state = {}
+state_lock = threading.Lock()
 
-# ══════════════════════════════════════════
-#  SHIFOKOR
-# ══════════════════════════════════════════
-def get_doc(uid):
-    with conn() as c:
-        return c.execute("SELECT * FROM doctors WHERE user_id=?", (uid,)).fetchone()
+def get_state(chat_id):
+    with state_lock:
+        return user_state.get(chat_id, {})
 
-def reg_doc(uid, uname, fname):
-    with conn() as c:
-        c.execute("INSERT OR IGNORE INTO doctors VALUES(?,?,?,0,?)",
-                  (uid, uname or "", fname, datetime.now().isoformat()))
-        c.commit()
+def set_state(chat_id, state):
+    with state_lock:
+        user_state[chat_id] = state
 
-def approved(uid):
-    if uid == ADMIN_ID: return True
-    d = get_doc(uid)
-    return bool(d and d[3] == 1)
+def clear_state(chat_id):
+    with state_lock:
+        user_state.pop(chat_id, None)
 
-def all_docs():
-    with conn() as c:
-        return c.execute("SELECT * FROM doctors ORDER BY joined_at DESC").fetchall()
+# ─────────────────────────── HELPERS ───────────────────────────
 
-# ══════════════════════════════════════════
-#  BEMOR
-# ══════════════════════════════════════════
-def add_patient(doc_id, last_name, first_name, birth_year, diagnosis, address, phone):
-    now = datetime.now()
-    notify_at = (now + timedelta(seconds=FIRST_NOTIFY_SECONDS)).isoformat()
-    with conn() as c:
-        c.execute("""
-            INSERT INTO patients
-            (doctor_id,last_name,first_name,birth_year,diagnosis,address,phone,
-             added_at,notify_at,status,retry_at,retry_count)
-            VALUES(?,?,?,?,?,?,?,?,?,'pending',NULL,0)
-        """, (doc_id, last_name, first_name, birth_year, diagnosis, address, phone,
-              now.isoformat(), notify_at))
-        c.commit()
+def is_admin(telegram_id):
+    return ADMIN_ID and telegram_id == ADMIN_ID
 
-def get_patients(doc_id):
-    with conn() as c:
-        return c.execute(
-            "SELECT * FROM patients WHERE doctor_id=? ORDER BY added_at DESC", (doc_id,)
-        ).fetchall()
+def get_doctor(telegram_id):
+    conn = get_db()
+    doc = conn.execute("SELECT * FROM doctors WHERE telegram_id=?", (telegram_id,)).fetchone()
+    conn.close()
+    return doc
 
-def get_patient_by_id(pid):
-    with conn() as c:
-        return c.execute("SELECT * FROM patients WHERE id=?", (pid,)).fetchone()
+def is_approved_doctor(telegram_id):
+    doc = get_doctor(telegram_id)
+    return doc and doc["approved"] == 1
 
-def all_patients_admin():
-    with conn() as c:
-        return c.execute("""
-            SELECT p.*, d.full_name as dname FROM patients p
-            JOIN doctors d ON p.doctor_id=d.user_id
-            ORDER BY p.added_at DESC
-        """).fetchall()
-
-STATUS_LABELS = {
-    "pending":   "⏳ Eslatma kutilmoqda",
-    "notified":  "🔔 Eslatma yuborildi",
-    "contacted": "✅ Bog'landi",
-    "retry":     "🔄 Qayta eslatma rejalashtirildi",
-}
-
-def format_patient(p, show_doc=None):
-    # p columns: 0=id,1=doctor_id,2=last_name,3=first_name,4=birth_year,
-    #            5=diagnosis,6=address,7=phone,8=added_at,9=notify_at,
-    #            10=status,11=retry_at,12=retry_count
-    added   = p[8][:16].replace("T"," ") if p[8] else "-"
-    notify  = p[9][:16].replace("T"," ") if p[9] else "-"
-    status  = STATUS_LABELS.get(p[10], p[10])
-    retry   = p[11][:16].replace("T"," ") if p[11] else "-"
-    text = (
-        f"👤 <b>{p[2]} {p[3]}</b>\n"
-        f"🎂 Tug'ilgan yil: <b>{p[4]}</b>\n"
-        f"🏥 Kasallik: {p[5]}\n"
-        f"🏠 Manzil: {p[6]}\n"
-        f"📞 Telefon: <b>{p[7]}</b>\n"
-        f"📅 Kiritilgan: {added}\n"
-        f"⏰ Eslatma: {notify}\n"
-        f"📬 Holat: {status}"
-    )
-    if p[10] == "retry":
-        text += f"\n🔁 Qayta eslatma: {retry}"
-    if show_doc:
-        text += f"\n🩺 Shifokor: {show_doc}"
-    return text
-
-# ══════════════════════════════════════════
-#  KLAVIATURALAR
-# ══════════════════════════════════════════
-def menu_kb(uid):
-    rows = [
-        [{"text": "➕ Bemor qo'shish"}],
-        [{"text": "📋 Mening bemorlarim"}],
-    ]
-    if uid == ADMIN_ID:
-        rows += [
-            [{"text": "👥 Shifokorlar ro'yxati"}],
-            [{"text": "📊 Barcha bemorlar"}],
+def main_menu_kb():
+    return {
+        "inline_keyboard": [
+            [{"text": "➕ Bemor qo'shish", "callback_data": "add_patient"}],
+            [{"text": "📋 Bemorlar ro'yxati", "callback_data": "list_patients"}],
+            [{"text": "🔍 Bemor statusi", "callback_data": "patient_status"}],
         ]
-    return {"keyboard": rows, "resize_keyboard": True}
+    }
 
-def cancel_kb():
-    return {"keyboard": [[{"text": "❌ Bekor qilish"}]], "resize_keyboard": True}
+def admin_menu_kb():
+    return {
+        "inline_keyboard": [
+            [{"text": "👨‍⚕️ Shifokorlar ro'yxati", "callback_data": "admin_doctors"}],
+            [{"text": "✅ Shifokor tasdiqlash", "callback_data": "admin_approve"}],
+            [{"text": "❌ Shifokor bloklash", "callback_data": "admin_block"}],
+            [{"text": "📊 Barcha bemorlar", "callback_data": "admin_all_patients"}],
+            [{"text": "📈 Statistika", "callback_data": "admin_stats"}],
+        ]
+    }
 
-def contact_inline_kb(patient_id):
-    """Eslatma xabariga qo'shiladigan inline tugmalar"""
-    return {"inline_keyboard": [[
-        {"text": "✅ Bog'landim",      "callback_data": f"contacted:{patient_id}"},
-        {"text": "❌ Bog'lana olmadim", "callback_data": f"retry:{patient_id}"},
-    ]]}
+# ─────────────────────────── NOTIFY WORKER ───────────────────────────
 
-# ══════════════════════════════════════════
-#  BEMOR QO'SHISH OQIMI
-# ══════════════════════════════════════════
-STEPS = [
-    ("last_name",   "👤 Bemor <b>familiyasini</b> kiriting:"),
-    ("first_name",  "👤 Bemor <b>ismini</b> kiriting:"),
-    ("birth_year",  "🎂 <b>Tug'ilgan yilini</b> kiriting (masalan: 1985):"),
-    ("diagnosis",   "🏥 <b>Kasalligini</b> kiriting:"),
-    ("address",     "🏠 <b>Yashash manzilini</b> kiriting:"),
-    ("phone",       "📞 <b>Telefon raqamini</b> kiriting:"),
-]
-STEP_KEYS  = [s[0] for s in STEPS]
-NEXT_STEP  = {STEP_KEYS[i]: STEP_KEYS[i+1] for i in range(len(STEP_KEYS)-1)}
-
-def patient_flow(uid, text, state, data):
-    current = state.replace("ap_", "")
-    val = text.strip()
-
-    # --- Validatsiya ---
-    if current == "birth_year":
-        try:
-            y = int(val)
-            assert 1900 < y <= datetime.now().year
-        except:
-            send(uid, "❌ Noto'g'ri yil! Masalan: <b>1985</b>. Qaytadan kiriting:", reply_markup=cancel_kb())
-            return
-
-    if current == "phone" and len(val) < 7:
-        send(uid, "❌ Raqam noto'g'ri. Qaytadan kiriting:", reply_markup=cancel_kb())
-        return
-
-    data[current] = val
-
-    if current in NEXT_STEP:
-        nxt = NEXT_STEP[current]
-        prompt = dict(STEPS)[nxt]
-        set_sess(uid, f"ap_{nxt}", data)
-        send(uid, prompt, reply_markup=cancel_kb())
-    else:
-        # Yakunlash — barcha maydonlar to'ldirildi
-        _save_and_confirm(uid, data)
-
-def _save_and_confirm(uid, data):
-    add_patient(
-        uid,
-        data.get("last_name",""),
-        data.get("first_name",""),
-        int(data.get("birth_year", 0)),
-        data.get("diagnosis",""),
-        data.get("address",""),
-        data.get("phone",""),
-    )
-    del_sess(uid)
-    mode = "1 soatdan" if TEST_MODE else "80 kundan"
-    preview = (
-        f"✅ <b>Bemor muvaffaqiyatli qo'shildi!</b>\n\n"
-        f"👤 {data.get('last_name','')} {data.get('first_name','')}\n"
-        f"🎂 {data.get('birth_year','')}\n"
-        f"🏥 {data.get('diagnosis','')}\n"
-        f"🏠 {data.get('address','')}\n"
-        f"📞 {data.get('phone','')}\n\n"
-        f"⏰ <b>{mode} keyin</b> sizga eslatma yuboriladi."
-    )
-    send(uid, preview, reply_markup=menu_kb(uid))
-
-# ══════════════════════════════════════════
-#  START / REGISTER
-# ══════════════════════════════════════════
-def handle_start(uid, uname, fname):
-    doc = get_doc(uid)
-    if not doc:
-        reg_doc(uid, uname, fname)
-        if uid == ADMIN_ID:
-            with conn() as c:
-                c.execute("UPDATE doctors SET approved=1 WHERE user_id=?", (uid,))
-                c.commit()
-            mode = "TEST (1 soat / 5 daqiqa)" if TEST_MODE else "ISHCHI (80 kun / 5 kun)"
-            send(uid, f"👨‍💻 <b>Admin sifatida xush kelibsiz!</b>\n\nBot rejimi: <b>{mode}</b>",
-                 reply_markup=menu_kb(uid))
-        else:
-            send(uid,
-                 f"👋 Salom, <b>{fname}</b>!\n\n"
-                 "Tibbiy bot tizimiga xush kelibsiz.\n"
-                 "⏳ Admin tasdig'ini kuting — tasdiqlangach xabar olasiz.")
-            send(ADMIN_ID,
-                 f"🔔 <b>Yangi shifokor!</b>\n\n"
-                 f"👤 {fname}\n🆔 {uid}\n📎 @{uname or '-'}\n\n"
-                 f"Tasdiqlash: /approve_{uid}\n"
-                 f"Rad etish: /reject_{uid}")
-    else:
-        if approved(uid):
-            send(uid, f"✅ Xush kelibsiz, <b>{fname}</b>!", reply_markup=menu_kb(uid))
-        else:
-            s = {0:"⏳ Kutmoqda", 2:"❌ Rad etilgan"}.get(doc[3], "Noma'lum")
-            send(uid, f"Sizning so'rovingiz holati: <b>{s}</b>")
-
-# ══════════════════════════════════════════
-#  CALLBACK HANDLER (bog'landim / bog'lana olmadim)
-# ══════════════════════════════════════════
-def handle_callback(cb):
-    uid     = cb["from"]["id"]
-    cb_id   = cb["id"]
-    data    = cb.get("data","")
-    msg_id  = cb["message"]["message_id"]
-    chat_id = cb["message"]["chat"]["id"]
-
-    if not data or ":" not in data:
-        answer_cb(cb_id, "Noma'lum buyruq")
-        return
-
-    action, pid_str = data.split(":", 1)
-    pid = int(pid_str)
-    patient = get_patient_by_id(pid)
-
-    if not patient:
-        answer_cb(cb_id, "Bemor topilmadi")
-        return
-
-    # Faqat o'sha shifokor yoki admin
-    if uid != patient[1] and uid != ADMIN_ID:
-        answer_cb(cb_id, "❌ Ruxsatingiz yo'q")
-        return
-
-    # Allaqachon yakunlangan bo'lsa
-    if patient[10] == "contacted":
-        answer_cb(cb_id, "✅ Bu bemor allaqachon bog'langan deb belgilangan")
-        edit_reply_markup(chat_id, msg_id)
-        return
-
-    if action == "contacted":
-        with conn() as c:
-            c.execute("UPDATE patients SET status='contacted' WHERE id=?", (pid,))
-            c.commit()
-        answer_cb(cb_id, "✅ Qayd etildi!")
-        edit_reply_markup(chat_id, msg_id)  # Tugmalarni olib tashlash
-        p = get_patient_by_id(pid)
-        send(chat_id,
-             f"✅ <b>Bog'landi deb belgilandi</b>\n\n"
-             f"👤 {p[2]} {p[3]} bilan bog'lanish tasdiqlandi.\n"
-             f"📅 {datetime.now().strftime('%Y-%m-%d %H:%M')}")
-        log.info(f"Contacted: patient {pid} by doctor {uid}")
-
-    elif action == "retry":
-        retry_at = (datetime.now() + timedelta(seconds=RETRY_NOTIFY_SECONDS)).isoformat()
-        with conn() as c:
-            c.execute("""UPDATE patients SET status='retry', retry_at=?,
-                         retry_count=retry_count+1 WHERE id=?""", (retry_at, pid))
-            c.commit()
-        p = get_patient_by_id(pid)
-        retry_label = "5 daqiqadan" if TEST_MODE else "5 kundan"
-        answer_cb(cb_id, f"🔄 {retry_label} keyin qayta eslatiladi")
-        edit_reply_markup(chat_id, msg_id)
-        send(chat_id,
-             f"🔄 <b>Qayta eslatma rejalashtirildi</b>\n\n"
-             f"👤 {p[2]} {p[3]}\n"
-             f"📞 {p[7]}\n\n"
-             f"⏰ <b>{retry_label} keyin</b> yana eslatiladi.")
-        log.info(f"Retry: patient {pid} by doctor {uid}, retry_at={retry_at}")
-
-# ══════════════════════════════════════════
-#  XABAR HANDLER
-# ══════════════════════════════════════════
-def handle_message(msg):
-    uid   = msg["from"]["id"]
-    uname = msg["from"].get("username","")
-    fname = (msg["from"].get("first_name","")+" "+msg["from"].get("last_name","")).strip()
-    text  = msg.get("text","").strip()
-
-    state, sdata = get_sess(uid)
-
-    # /start
-    if text.startswith("/start"):
-        del_sess(uid)
-        handle_start(uid, uname, fname)
-        return
-
-    # Admin buyruqlari
-    if uid == ADMIN_ID:
-        if text.startswith("/approve_"):
-            try:
-                tid = int(text.split("_",1)[1])
-                with conn() as c:
-                    c.execute("UPDATE doctors SET approved=1 WHERE user_id=?", (tid,))
-                    c.commit()
-                d = get_doc(tid)
-                send(uid, f"✅ {d[2] if d else tid} tasdiqlandi.")
-                send(tid, "✅ <b>Tabriklaymiz!</b> Siz tizimga qo'shildingiz!\n\n/start bosing.",
-                     reply_markup=menu_kb(tid))
-            except Exception as e:
-                send(uid, f"Xato: {e}")
-            return
-
-        if text.startswith("/reject_"):
-            try:
-                tid = int(text.split("_",1)[1])
-                with conn() as c:
-                    c.execute("UPDATE doctors SET approved=2 WHERE user_id=?", (tid,))
-                    c.commit()
-                d = get_doc(tid)
-                send(uid, f"❌ {d[2] if d else tid} rad etildi.")
-                send(tid, "❌ So'rovingiz rad etildi. Qo'shimcha ma'lumot uchun admin bilan bog'laning.")
-            except Exception as e:
-                send(uid, f"Xato: {e}")
-            return
-
-    # Ro'yxatdan o'tmagan
-    if not get_doc(uid):
-        send(uid, "Iltimos /start bosing.")
-        return
-
-    # Tasdiqlanmagan
-    if not approved(uid):
-        send(uid, "⏳ Hisobingiz hali tasdiqlanmagan. Admin xabar beradi.")
-        return
-
-    # Bekor qilish
-    if text == "❌ Bekor qilish":
-        del_sess(uid)
-        send(uid, "Bekor qilindi.", reply_markup=menu_kb(uid))
-        return
-
-    # Bemor qo'shish oqimi
-    if state and state.startswith("ap_"):
-        patient_flow(uid, text, state, sdata)
-        return
-
-    # ── MENYU ──
-    if text == "➕ Bemor qo'shish":
-        set_sess(uid, "ap_last_name", {})
-        send(uid, dict(STEPS)["last_name"], reply_markup=cancel_kb())
-
-    elif text == "📋 Mening bemorlarim":
-        pts = get_patients(uid)
-        if not pts:
-            send(uid, "📭 Sizda hali bemor yo'q.", reply_markup=menu_kb(uid))
-        else:
-            send(uid, f"📋 <b>Sizning bemorlaringiz — {len(pts)} nafar</b>",
-                 reply_markup=menu_kb(uid))
-            for p in pts:
-                send(uid, format_patient(p))
-
-    elif text == "👥 Shifokorlar ro'yxati" and uid == ADMIN_ID:
-        docs = all_docs()
-        if not docs:
-            send(uid, "Hech kim ro'yxatdan o'tmagan.")
-            return
-        sm = {0:"⏳ Kutmoqda", 1:"✅ Tasdiqlangan", 2:"❌ Rad etilgan"}
-        lines = [f"👥 <b>Shifokorlar — {len(docs)} nafar</b>"]
-        for d in docs:
-            uid2, uname2, fname2, appr, joined = d
-            bcount = len(get_patients(uid2))
-            line = (f"\n{sm.get(appr,'?')} <b>{fname2}</b> (@{uname2 or '-'})\n"
-                    f"   🆔 {uid2} | 📅 {joined[:10]} | 👥 {bcount} bemor")
-            if appr == 0:
-                line += f"\n   👉 /approve_{uid2}  |  /reject_{uid2}"
-            lines.append(line)
-        send(uid, "\n".join(lines), reply_markup=menu_kb(uid))
-
-    elif text == "📊 Barcha bemorlar" and uid == ADMIN_ID:
-        pts = all_patients_admin()
-        if not pts:
-            send(uid, "📭 Hech qanday bemor yo'q.")
-            return
-        send(uid, f"📊 <b>Jami bemorlar: {len(pts)} nafar</b>", reply_markup=menu_kb(uid))
-        for p in pts:
-            dname = p[-1] if len(p) > 13 else "?"
-            send(uid, format_patient(p, show_doc=dname))
-
-    else:
-        send(uid, "Iltimos, tugmalardan foydalaning. 👇", reply_markup=menu_kb(uid))
-
-# ══════════════════════════════════════════
-#  ESLATMA SERVISI (background thread)
-# ══════════════════════════════════════════
 def notify_worker():
-    log.info("Eslatma xizmati ishga tushdi.")
+    logger.info(f"Notify worker started. Mode: {'TEST (1 soat)' if TEST_MODE else '80 kun'}")
     while True:
         try:
-            now = datetime.now().isoformat()
-
-            with conn() as c:
-                # 1) Birinchi eslatma (pending → notified)
-                pending = c.execute(
-                    "SELECT id, doctor_id, last_name, first_name, diagnosis, phone "
-                    "FROM patients WHERE status='pending' AND notify_at<=?", (now,)
-                ).fetchall()
-
-                # 2) Qayta eslatma (retry → notified)
-                retries = c.execute(
-                    "SELECT id, doctor_id, last_name, first_name, diagnosis, phone, retry_count "
-                    "FROM patients WHERE status='retry' AND retry_at<=?", (now,)
-                ).fetchall()
-
-            mode_label = "1 SOAT (test)" if TEST_MODE else "80 KUN"
-
-            for row in pending:
-                pid, doc_id, lname, fname, diag, phone = row
-                _send_notify(pid, doc_id, lname, fname, diag, phone, mode_label, is_retry=False)
-
-            for row in retries:
-                pid, doc_id, lname, fname, diag, phone, rcnt = row
-                _send_notify(pid, doc_id, lname, fname, diag, phone,
-                             f"QAYTA ESLATMA #{rcnt+1}", is_retry=True)
-
+            conn = get_db()
+            now = datetime.now()
+            patients = conn.execute(
+                "SELECT p.*, d.telegram_id as doc_tg FROM patients p "
+                "JOIN doctors d ON p.doctor_id = d.id "
+                "WHERE p.notified=0 AND p.notify_at <= ?",
+                (now.strftime("%Y-%m-%d %H:%M:%S"),)
+            ).fetchall()
+            for p in patients:
+                msg = (
+                    f"⏰ <b>Eslatma!</b>\n\n"
+                    f"Bemor: <b>{p['full_name']}</b>\n"
+                    f"Tug'ilgan yili: {p['birth_year']}\n"
+                    f"Telefon: {p['phone']}\n"
+                    f"Kasallik: {p['disease']}\n"
+                    f"Manzil: {p['address']}\n"
+                    f"Izoh: {p['notes'] or '-'}\n\n"
+                    f"📅 Qo'shilgan: {p['created_at']}\n"
+                    f"{('⚠️ TEST: 1 soat otdi!' if TEST_MODE else '⚠️ 80 kun otdi!')}"
+                )
+                send_message(p["doc_tg"], msg)
+                conn.execute("UPDATE patients SET notified=1 WHERE id=?", (p["id"],))
+                conn.commit()
+                logger.info(f"Notified doctor {p['doc_tg']} about patient {p['full_name']}")
+            conn.close()
         except Exception as e:
-            log.error(f"notify_worker: {e}")
+            logger.error(f"Notify worker error: {e}")
+        time.sleep(60)  # check every minute
 
-        time.sleep(30)  # 30 sekunda
 
-def _send_notify(pid, doc_id, lname, fname, diag, phone, label, is_retry):
-    msg = (
-        f"{'🔄' if is_retry else '🔔'} <b>ESLATMA — {label}</b>\n\n"
-        f"👤 Bemor: <b>{lname} {fname}</b>\n"
-        f"🏥 Kasallik: {diag}\n"
-        f"📞 Telefon: <b>{phone}</b>\n\n"
-        f"Iltimos, bemor bilan bog'laning va natijani belgilang:"
-    )
-    result = send(doc_id, msg, reply_markup=contact_inline_kb(pid))
-    if result and result.get("ok"):
-        with conn() as c:
-            c.execute("UPDATE patients SET status='notified' WHERE id=?", (pid,))
-            c.commit()
-        log.info(f"Eslatma yuborildi → patient {pid} → doctor {doc_id} [{label}]")
-    else:
-        log.warning(f"Eslatma yuborilmadi: patient={pid} result={result}")
+# ─────────────────────────── BOOTSTRAP (Gunicorn/Render uchun) ───────────────────────────
 
-# ══════════════════════════════════════════
-#  ASOSIY POLLING
-# ══════════════════════════════════════════
-def main():
+_BOOTSTRAPPED = False
+
+def bootstrap():
+    """
+    Render/Gunicorn ishga tushganda __main__ ishlamaydi.
+    Shu sabab DB init va background worker import paytida ishga tushishi kerak.
+    Eslatma: gunicorn workers>1 bo‘lsa, worker’lar ko‘payib ketadi (duplikat eslatmalar).
+    """
+    global _BOOTSTRAPPED
+    if _BOOTSTRAPPED:
+        return
+
     init_db()
-    mode = "TEST (1 soat / 5 daqiqa)" if TEST_MODE else "ISHCHI (80 kun / 5 kun)"
-    log.info(f"Bot ishga tushdi. Rejim: {mode}")
 
-    t = threading.Thread(target=notify_worker, daemon=True)
-    t.start()
+    if os.environ.get("DISABLE_WORKER", "false").lower() != "true":
+        t = threading.Thread(target=notify_worker, daemon=True)
+        t.start()
 
-    offset = 0
-    while True:
-        updates = get_updates(offset)
-        for upd in updates:
-            offset = upd["update_id"] + 1
+    # Ixtiyoriy: server ishga tushganda webhook’ni avtomatik o‘rnatish
+    if os.environ.get("AUTO_SET_WEBHOOK", "false").lower() == "true":
+        public_url = os.environ.get("PUBLIC_URL", "").strip().rstrip("/")
+        if public_url:
             try:
-                if "message" in upd and "text" in upd["message"]:
-                    handle_message(upd["message"])
-                elif "callback_query" in upd:
-                    handle_callback(upd["callback_query"])
+                set_webhook(f"{public_url}/webhook")
             except Exception as e:
-                log.error(f"Update xato: {e}", exc_info=True)
+                logger.error(f"AUTO_SET_WEBHOOK error: {e}")
+
+    _BOOTSTRAPPED = True
+
+
+bootstrap()
+
+# ─────────────────────────── HANDLERS ───────────────────────────
+
+def handle_start(chat_id, telegram_id, user):
+    full_name = f"{user.get('first_name','')} {user.get('last_name','')}".strip()
+    username = user.get("username", "")
+
+    if is_admin(telegram_id):
+        send_message(chat_id,
+            f"👋 Xush kelibsiz, Admin <b>{full_name}</b>!\n\nAdmin paneli:",
+            reply_markup=admin_menu_kb())
+        return
+
+    doc = get_doctor(telegram_id)
+    if not doc:
+        # Register new doctor
+        conn = get_db()
+        conn.execute(
+            "INSERT OR IGNORE INTO doctors (telegram_id, name, username) VALUES (?,?,?)",
+            (telegram_id, full_name, username)
+        )
+        conn.commit()
+        conn.close()
+        send_message(chat_id,
+            f"👋 Salom, Dr. <b>{full_name}</b>!\n\n"
+            "✅ Ro'yxatdan o'tdingiz. Admin tasdiqlashini kuting.\n"
+            "Tasdiqlanganingizda xabar beramiz.")
+        # Notify admin
+        if ADMIN_ID:
+            send_message(ADMIN_ID,
+                f"🆕 Yangi shifokor ro'yxatdan o'tdi:\n"
+                f"Ism: <b>{full_name}</b>\n"
+                f"Username: @{username}\n"
+                f"ID: <code>{telegram_id}</code>\n\n"
+                f"Tasdiqlash uchun /approve_{telegram_id}")
+        return
+
+    if doc["approved"] == 0:
+        send_message(chat_id, "⏳ Sizning so'rovingiz hali tasdiqlanmagan. Kuting.")
+        return
+
+    send_message(chat_id,
+        f"👋 Xush kelibsiz, Dr. <b>{full_name}</b>!\n\nNimа qilmoqchisiz?",
+        reply_markup=main_menu_kb())
+
+
+def handle_add_patient_start(chat_id):
+    set_state(chat_id, {"step": "add_name", "data": {}})
+    send_message(chat_id, "📝 Bemorning <b>ismi va familiyasini</b> kiriting:")
+
+
+def handle_list_patients(chat_id, telegram_id):
+    conn = get_db()
+    doc = conn.execute("SELECT id FROM doctors WHERE telegram_id=?", (telegram_id,)).fetchone()
+    if not doc:
+        conn.close()
+        send_message(chat_id, "❌ Siz shifokor sifatida topilmadingiz.")
+        return
+    patients = conn.execute(
+        "SELECT * FROM patients WHERE doctor_id=? ORDER BY created_at DESC LIMIT 20",
+        (doc["id"],)
+    ).fetchall()
+    conn.close()
+
+    if not patients:
+        send_message(chat_id, "📭 Sizda hozircha bemorlar yo'q.")
+        return
+
+    text = "📋 <b>Bemorlaringiz ro'yxati:</b>\n\n"
+    for i, p in enumerate(patients, 1):
+        status = "✅ Xabar berildi" if p["notified"] else f"⏳ {p['notify_at']} ga xabar"
+        text += (
+            f"{i}. <b>{p['full_name']}</b>\n"
+            f"   📅 {p['birth_year']} | 📞 {p['phone']}\n"
+            f"   🏥 {p['disease']}\n"
+            f"   {status}\n\n"
+        )
+    send_message(chat_id, text)
+
+
+def handle_patient_status(chat_id, telegram_id):
+    set_state(chat_id, {"step": "status_search", "data": {}})
+    send_message(chat_id, "🔍 Bemor ismini kiriting (qidirish uchun):")
+
+
+def handle_admin_doctors(chat_id):
+    conn = get_db()
+    docs = conn.execute("SELECT * FROM doctors ORDER BY created_at DESC").fetchall()
+    conn.close()
+    if not docs:
+        send_message(chat_id, "Hozircha hech kim ro'yxatdan o'tmagan.")
+        return
+    text = "👨‍⚕️ <b>Shifokorlar ro'yxati:</b>\n\n"
+    for d in docs:
+        status = "✅ Tasdiqlangan" if d["approved"] else "⏳ Kutmoqda"
+        text += f"• <b>{d['name']}</b> (@{d['username']})\n  ID: <code>{d['telegram_id']}</code> | {status}\n\n"
+    send_message(chat_id, text)
+
+
+def handle_admin_approve_list(chat_id):
+    conn = get_db()
+    docs = conn.execute("SELECT * FROM doctors WHERE approved=0").fetchall()
+    conn.close()
+    if not docs:
+        send_message(chat_id, "✅ Tasdiqlanmagan shifokorlar yo'q.")
+        return
+    kb = {"inline_keyboard": [
+        [{"text": f"✅ {d['name']}", "callback_data": f"approve_{d['telegram_id']}"}]
+        for d in docs
+    ]}
+    send_message(chat_id, "Qaysi shifokorni tasdiqlaysiz?", reply_markup=kb)
+
+
+def handle_admin_block_list(chat_id):
+    conn = get_db()
+    docs = conn.execute("SELECT * FROM doctors WHERE approved=1").fetchall()
+    conn.close()
+    if not docs:
+        send_message(chat_id, "Faol shifokorlar yo'q.")
+        return
+    kb = {"inline_keyboard": [
+        [{"text": f"❌ {d['name']}", "callback_data": f"block_{d['telegram_id']}"}]
+        for d in docs
+    ]}
+    send_message(chat_id, "Qaysi shifokorni bloklaysiz?", reply_markup=kb)
+
+
+def handle_approve_doctor(chat_id, doc_tg_id):
+    conn = get_db()
+    conn.execute("UPDATE doctors SET approved=1 WHERE telegram_id=?", (doc_tg_id,))
+    conn.commit()
+    doc = conn.execute("SELECT * FROM doctors WHERE telegram_id=?", (doc_tg_id,)).fetchone()
+    conn.close()
+    send_message(chat_id, f"✅ Dr. <b>{doc['name']}</b> tasdiqlandi!")
+    send_message(doc_tg_id,
+        "🎉 Siz tasdiqlandi! Endi botdan foydalanishingiz mumkin.\n/start",
+    )
+
+
+def handle_block_doctor(chat_id, doc_tg_id):
+    conn = get_db()
+    conn.execute("UPDATE doctors SET approved=0 WHERE telegram_id=?", (doc_tg_id,))
+    conn.commit()
+    doc = conn.execute("SELECT * FROM doctors WHERE telegram_id=?", (doc_tg_id,)).fetchone()
+    conn.close()
+    send_message(chat_id, f"❌ Dr. <b>{doc['name']}</b> bloklandi.")
+    send_message(doc_tg_id, "⛔ Sizning kirishingiz vaqtincha to'xtatildi.")
+
+
+def handle_admin_all_patients(chat_id):
+    conn = get_db()
+    rows = conn.execute(
+        "SELECT p.*, d.name as doc_name FROM patients p "
+        "JOIN doctors d ON p.doctor_id=d.id ORDER BY p.created_at DESC LIMIT 30"
+    ).fetchall()
+    conn.close()
+    if not rows:
+        send_message(chat_id, "📭 Hozircha bemorlar yo'q.")
+        return
+    text = "📊 <b>Barcha bemorlar (oxirgi 30):</b>\n\n"
+    for p in rows:
+        status = "✅" if p["notified"] else "⏳"
+        text += f"{status} <b>{p['full_name']}</b> — Dr. {p['doc_name']}\n   🏥 {p['disease']} | {p['created_at'][:10]}\n\n"
+    send_message(chat_id, text)
+
+
+def handle_admin_stats(chat_id):
+    conn = get_db()
+    total_docs = conn.execute("SELECT COUNT(*) FROM doctors WHERE approved=1").fetchone()[0]
+    total_patients = conn.execute("SELECT COUNT(*) FROM patients").fetchone()[0]
+    notified = conn.execute("SELECT COUNT(*) FROM patients WHERE notified=1").fetchone()[0]
+    pending = conn.execute("SELECT COUNT(*) FROM patients WHERE notified=0").fetchone()[0]
+    conn.close()
+    send_message(chat_id,
+        f"📈 <b>Statistika:</b>\n\n"
+        f"👨‍⚕️ Faol shifokorlar: {total_docs}\n"
+        f"🧑‍🤝‍🧑 Jami bemorlar: {total_patients}\n"
+        f"✅ Xabar berilganlar: {notified}\n"
+        f"⏳ Kutayotganlar: {pending}\n"
+        f"\n⚙️ Rejim: {'TEST (1 soat)' if TEST_MODE else '80 kun'}"
+    )
+
+
+# ─────────────────────────── TEXT MESSAGE STEPS ───────────────────────────
+
+def handle_text_steps(chat_id, telegram_id, text):
+    state = get_state(chat_id)
+    step = state.get("step")
+    data = state.get("data", {})
+
+    # ── Add patient flow ──
+    if step == "add_name":
+        data["full_name"] = text
+        set_state(chat_id, {"step": "add_birth_year", "data": data})
+        send_message(chat_id, "📅 Tug'ilgan yilini kiriting (masalan: 1985):")
+
+    elif step == "add_birth_year":
+        if not text.isdigit() or not (1900 < int(text) < 2025):
+            send_message(chat_id, "❌ Noto'g'ri yil. Iltimos, to'g'ri yil kiriting:")
+            return
+        data["birth_year"] = int(text)
+        set_state(chat_id, {"step": "add_phone", "data": data})
+        send_message(chat_id, "📞 Telefon raqamini kiriting:")
+
+    elif step == "add_phone":
+        data["phone"] = text
+        set_state(chat_id, {"step": "add_disease", "data": data})
+        send_message(chat_id, "🏥 Kasallik turini kiriting:")
+
+    elif step == "add_disease":
+        data["disease"] = text
+        set_state(chat_id, {"step": "add_address", "data": data})
+        send_message(chat_id, "🏠 Yashash manzilini kiriting:")
+
+    elif step == "add_address":
+        data["address"] = text
+        set_state(chat_id, {"step": "add_notes", "data": data})
+        send_message(chat_id, "📝 Qo'shimcha izoh kiriting (yoki 'yo'q' deb yozing):")
+
+    elif step == "add_notes":
+        data["notes"] = "" if text.lower() in ("yo'q", "yoq", "-", "no") else text
+        # Save to DB
+        conn = get_db()
+        doc = conn.execute("SELECT id FROM doctors WHERE telegram_id=?", (telegram_id,)).fetchone()
+        if not doc:
+            conn.close()
+            send_message(chat_id, "❌ Xato: Shifokor topilmadi.")
+            clear_state(chat_id)
+            return
+
+        notify_at = (datetime.now() + timedelta(seconds=NOTIFY_SECONDS)).strftime("%Y-%m-%d %H:%M:%S")
+        conn.execute(
+            "INSERT INTO patients (doctor_id, full_name, birth_year, phone, disease, address, notes, notify_at) "
+            "VALUES (?,?,?,?,?,?,?,?)",
+            (doc["id"], data["full_name"], data["birth_year"], data["phone"],
+             data["disease"], data["address"], data["notes"], notify_at)
+        )
+        conn.commit()
+        conn.close()
+        clear_state(chat_id)
+        send_message(chat_id,
+            f"✅ <b>Bemor muvaffaqiyatli qo'shildi!</b>\n\n"
+            f"👤 Ism: {data['full_name']}\n"
+            f"📅 Tug'ilgan yil: {data['birth_year']}\n"
+            f"📞 Telefon: {data['phone']}\n"
+            f"🏥 Kasallik: {data['disease']}\n"
+            f"🏠 Manzil: {data['address']}\n"
+            f"📝 Izoh: {data['notes'] or '-'}\n\n"
+            f"⏰ Eslatma: {notify_at}\n"
+            f"{'(TEST: 1 soatdan keyin)' if TEST_MODE else '(80 kundan keyin)'}",
+            reply_markup=main_menu_kb()
+        )
+
+    # ── Patient status search ──
+    elif step == "status_search":
+        conn = get_db()
+        doc = conn.execute("SELECT id FROM doctors WHERE telegram_id=?", (telegram_id,)).fetchone()
+        if not doc:
+            conn.close()
+            clear_state(chat_id)
+            return
+        patients = conn.execute(
+            "SELECT * FROM patients WHERE doctor_id=? AND full_name LIKE ?",
+            (doc["id"], f"%{text}%")
+        ).fetchall()
+        conn.close()
+        clear_state(chat_id)
+
+        if not patients:
+            send_message(chat_id, f"❌ '{text}' nomli bemor topilmadi.", reply_markup=main_menu_kb())
+            return
+
+        result = "🔍 <b>Topilgan bemorlar:</b>\n\n"
+        for p in patients:
+            status = "✅ Xabar berildi" if p["notified"] else f"⏳ Xabar vaqti: {p['notify_at']}"
+            result += (
+                f"👤 <b>{p['full_name']}</b>\n"
+                f"   📅 {p['birth_year']} | 📞 {p['phone']}\n"
+                f"   🏥 {p['disease']}\n"
+                f"   🏠 {p['address']}\n"
+                f"   📝 {p['notes'] or '-'}\n"
+                f"   {status}\n"
+                f"   🗓 Qo'shilgan: {p['created_at'][:16]}\n\n"
+            )
+        send_message(chat_id, result, reply_markup=main_menu_kb())
+
+    else:
+        # No active state — show menu
+        if is_admin(telegram_id):
+            send_message(chat_id, "Admin panel:", reply_markup=admin_menu_kb())
+        elif is_approved_doctor(telegram_id):
+            send_message(chat_id, "Menyu:", reply_markup=main_menu_kb())
+
+
+# ─────────────────────────── UPDATE DISPATCHER ───────────────────────────
+
+def process_update(update):
+    try:
+        # Callback query
+        if "callback_query" in update:
+            cq = update["callback_query"]
+            cq_id = cq["id"]
+            data = cq.get("data", "")
+            chat_id = cq["message"]["chat"]["id"]
+            telegram_id = cq["from"]["id"]
+            answer_callback(cq_id)
+
+            if not is_admin(telegram_id) and not is_approved_doctor(telegram_id):
+                send_message(chat_id, "⛔ Sizda ruxsat yo'q.")
+                return
+
+            if data == "add_patient":
+                handle_add_patient_start(chat_id)
+            elif data == "list_patients":
+                handle_list_patients(chat_id, telegram_id)
+            elif data == "patient_status":
+                handle_patient_status(chat_id, telegram_id)
+            elif data == "admin_doctors":
+                handle_admin_doctors(chat_id)
+            elif data == "admin_approve":
+                handle_admin_approve_list(chat_id)
+            elif data == "admin_block":
+                handle_admin_block_list(chat_id)
+            elif data == "admin_all_patients":
+                handle_admin_all_patients(chat_id)
+            elif data == "admin_stats":
+                handle_admin_stats(chat_id)
+            elif data.startswith("approve_"):
+                doc_tg = int(data.split("_")[1])
+                handle_approve_doctor(chat_id, doc_tg)
+            elif data.startswith("block_"):
+                doc_tg = int(data.split("_")[1])
+                handle_block_doctor(chat_id, doc_tg)
+            return
+
+        # Regular message
+        if "message" in update:
+            msg = update["message"]
+            chat_id = msg["chat"]["id"]
+            telegram_id = msg["from"]["id"]
+            user = msg["from"]
+            text = msg.get("text", "")
+
+            if text.startswith("/start"):
+                clear_state(chat_id)
+                handle_start(chat_id, telegram_id, user)
+
+            elif text.startswith("/admin") and is_admin(telegram_id):
+                send_message(chat_id, "Admin panel:", reply_markup=admin_menu_kb())
+
+            elif text.startswith("/approve_") and is_admin(telegram_id):
+                try:
+                    doc_tg = int(text.split("_")[1])
+                    handle_approve_doctor(chat_id, doc_tg)
+                except Exception:
+                    send_message(chat_id, "Noto'g'ri format.")
+
+            elif text.startswith("/stats") and is_admin(telegram_id):
+                handle_admin_stats(chat_id)
+
+            elif text.startswith("/testmode") and is_admin(telegram_id):
+                mode = "TEST (1 soat)" if TEST_MODE else "REAL (80 kun)"
+                send_message(chat_id, f"⚙️ Joriy rejim: {mode}\nO'zgartirish uchun TEST_MODE env o'zgartiring.")
+
+            elif text:
+                if is_admin(telegram_id):
+                    # Admin can also use doctor functions if they want
+                    state = get_state(chat_id)
+                    if state.get("step"):
+                        handle_text_steps(chat_id, telegram_id, text)
+                    else:
+                        send_message(chat_id, "Admin panel:", reply_markup=admin_menu_kb())
+                elif is_approved_doctor(telegram_id):
+                    handle_text_steps(chat_id, telegram_id, text)
+                else:
+                    doc = get_doctor(telegram_id)
+                    if doc:
+                        send_message(chat_id, "⏳ Sizning so'rovingiz hali tasdiqlanmagan.")
+                    else:
+                        send_message(chat_id, "Iltimos, /start buyrug'ini bosing.")
+    except Exception as e:
+        logger.error(f"process_update error: {e}", exc_info=True)
+
+
+# ─────────────────────────── FLASK ROUTES ───────────────────────────
+
+@app.route("/", methods=["GET"])
+def index():
+    return jsonify({"status": "ok", "bot": "Medical Bot", "mode": "TEST (1h)" if TEST_MODE else "PROD (80d)"})
+
+@app.route("/webhook", methods=["POST"])
+def webhook():
+    update = request.get_json(silent=True)
+    if update:
+        threading.Thread(target=process_update, args=(update,), daemon=True).start()
+    return jsonify({"ok": True})
+
+@app.route("/set_webhook", methods=["GET"])
+def setup_webhook():
+    url = request.args.get("url")
+    if not url:
+        return jsonify({"error": "url parameter required"}), 400
+    set_webhook(f"{url}/webhook")
+    return jsonify({"ok": True, "webhook": f"{url}/webhook"})
+
+@app.route("/health", methods=["GET"])
+def health():
+    conn = get_db()
+    docs = conn.execute("SELECT COUNT(*) FROM doctors").fetchone()[0]
+    patients = conn.execute("SELECT COUNT(*) FROM patients").fetchone()[0]
+    conn.close()
+    return jsonify({"status": "healthy", "doctors": docs, "patients": patients})
+
+
+# ─────────────────────────── MAIN ───────────────────────────
 
 if __name__ == "__main__":
-    main()
+    bootstrap()
+
+    PORT = int(os.environ.get("PORT", 10000))
+    logger.info(f"Starting Flask on port {PORT}")
+    logger.info(f"Mode: {'TEST (1 soat)' if TEST_MODE else 'PROD (80 kun)'}")
+    app.run(host="0.0.0.0", port=PORT)
